@@ -3,7 +3,7 @@
   Prefer loading via loader.luau.
 ]]
 local base = "https://raw.githubusercontent.com/territorialism/x64/main/src/chunks/"
-local n = 5
+local n = 10
 local parts = {}
 local fetch = function(url)
   if type(request) == "function" then
@@ -15,7 +15,7 @@ local fetch = function(url)
   return game:HttpGet(url)
 end
 for i = 1, n do
-  local url = base .. string.format("p%02d.luau", i)
+  local url = base .. string.format("c%02d.luau", i)
   local body = fetch(url)
   assert(type(body) == "string" and #body > 0, "missing chunk " .. tostring(i))
   parts[i] = body
