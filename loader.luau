@@ -20,10 +20,9 @@ local Loader = {
     -- Relative paths are resolved against raw.githubusercontent.com/{Owner}/{Repo}/{Branch}/
     -- Absolute https URLs are also accepted.
     Entries = {
-      "src/init.luau",
-      "main.luau",
-      -- Known-good full build on the sister repo until src/init.luau is published whole.
       "https://raw.githubusercontent.com/territorialism/x64ui/main/main.luau",
+      "main.luau",
+      "src/init.luau",
     },
     VersionFile = "version",
     Folder = "x64ui",
