@@ -1,61 +1,39 @@
 --[[
-  x64ui main entry (bootstrap)
+  x64ui main.luau
 
-  The previous tip main.luau was corrupted mid-file (line ~138) and would not
-  compile. Until the full 6.0.0 body is published as src/chunks/c01..c10,
-  this bootstrap loads a known-good library build.
+  Thin entry that returns the library. Prefer loading via loader.luau:
 
-  Prefer: loadstring(game:HttpGet(".../loader.luau"))()
+    local X64UI = loadstring(game:HttpGet(
+      "https://raw.githubusercontent.com/territorialism/x64/main/loader.luau?cb=" .. os.time(),
+      true
+    ))()
+
+  To publish a full monolithic build on this repo, replace this file with the
+  complete source (must end with `return X64UI` and be ~100KB+).
 ]]
 
-local urls = {
-  -- preferred: assembled clean chunks (when present)
-  "https://raw.githubusercontent.com/territorialism/x64/main/src/init.luau",
-  -- fallback: last known good monolithic build on the sister repo
-  "https://raw.githubusercontent.com/territorialism/x64ui/main/main.luau",
-}
-
-local function fetch(url)
-  if type(request) == "function" then
-    local ok, res = pcall(request, {
-      Url = url .. "?t=" .. tostring(os.clock()),
-      Method = "GET",
-      Headers = { ["Cache-Control"] = "no-cache" },
-    })
-    if ok and type(res) == "table" then
-      local status = tonumber(res.StatusCode) or 0
-      local body = res.Body
-      if status >= 200 and status < 300 and type(body) == "string" and #body > 4096 then
-        return body
-      end
-    end
-  end
-  local ok, body = pcall(function()
-    return game:HttpGet(url .. "?t=" .. tostring(os.clock()), true)
-  end)
-  if ok and type(body) == "string" and #body > 4096 then
-    return body
-  end
-  return nil
+local url = "https://raw.githubusercontent.com/territorialism/x64ui/main/main.luau"
+local ok, body = pcall(function()
+  return game:HttpGet(url .. "?cb=" .. tostring(os.time()), true)
+end)
+if not ok or type(body) ~= "string" or #body < 40000 then
+  error("[x64ui] failed to fetch library from " .. url .. " (" .. tostring(body) .. ")", 0)
+end
+if not body:find("return X64UI", 1, true) then
+  error("[x64ui] downloaded source is incomplete", 0)
 end
 
-local source, lastErr
-for _, url in ipairs(urls) do
-  local body = fetch(url)
-  if body and body:find("X64UI", 1, true) and body:find("CreateWindow", 1, true) then
-    local chunk, err = loadstring(body, "@x64ui")
-    if chunk then
-      local ok, lib = pcall(chunk)
-      if ok and type(lib) == "table" and type(lib.CreateWindow) == "function" then
-        return lib
-      end
-      lastErr = "runtime: " .. tostring(lib)
-    else
-      lastErr = "compile: " .. tostring(err)
-    end
-  else
-    lastErr = "fetch failed or too small: " .. url
-  end
+local chunk, err = loadstring(body, "@x64ui")
+if not chunk then
+  error("[x64ui] compile failed: " .. tostring(err), 0)
 end
 
-error("[x64ui] failed to load library — " .. tostring(lastErr), 0)
+local ran, lib = pcall(chunk)
+if not ran then
+  error("[x64ui] runtime: " .. tostring(lib), 0)
+end
+if type(lib) ~= "table" or type(lib.CreateWindow) ~= "function" then
+  error("[x64ui] library did not return CreateWindow", 0)
+end
+
+return lib
