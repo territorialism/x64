@@ -1,30 +1,29 @@
 --[[
-  x64ui/loader.luau
-  Fetches, caches and executes the x64ui library.
+  x64ui/loader.luau — r3
 
-  Usage:
-    local X64UI = loadstring(game:HttpGet(
-      "https://raw.githubusercontent.com/territorialism/x64/main/loader.luau?" .. tick()
-    ))()
+  ALWAYS invoke with a cache-buster, or GitHub's CDN will serve a stale
+  loader for up to five minutes:
 
-  Optional config (set BEFORE running the loader):
-    getgenv().X64UILoaderConfig = {
-      Branch = "main",
-      ForceRefresh = true,
-      Pin = "6.0.0-desktop",
-      Verbose = false,
-    }
+    local url = "https://raw.githubusercontent.com/territorialism/x64/main/loader.luau"
+    local X64UI = loadstring(game:HttpGet(url .. "?cb=" .. os.time(), true))()
+
+  Optional, set BEFORE running:
+
+    getgenv().X64UILoaderConfig = { ForceRefresh = true, Verbose = true }
 ]]
 
 local Loader = {
   Config = {
-    BaseUrl = "https://raw.githubusercontent.com/territorialism/x64/",
+    Owner = "territorialism",
+    Repo = "x64",
     Branch = "main",
-    -- Absolute URLs, tried in order until one validates.
+    -- Relative paths are resolved against raw.githubusercontent.com/{Owner}/{Repo}/{Branch}/
+    -- Absolute https URLs are also accepted.
     Entries = {
-      "https://raw.githubusercontent.com/territorialism/x64/main/src/init.luau",
+      "src/init.luau",
+      "main.luau",
+      -- Known-good full build on the sister repo until src/init.luau is published whole.
       "https://raw.githubusercontent.com/territorialism/x64ui/main/main.luau",
-      "https://raw.githubusercontent.com/territorialism/x64/main/main.luau",
     },
     VersionFile = "version",
     Folder = "x64ui",
@@ -32,10 +31,16 @@ local Loader = {
     Offline = false,
     ForceRefresh = false,
     Verbose = true,
-    Sentinel = "X64UI",
-    MinBytes = 8000,
+    -- Real library is ~110–150 KB. Anything under 40 KB is not it.
+    MinBytes = 40000,
+    -- Head, middle and tail markers so a partial upload cannot pass.
+    Markers = { "local X64UI", "CreateWindow", "AddToggle", "return X64UI" },
   },
 }
+
+--==============================================================
+-- OUTPUT
+--==============================================================
 
 local function info(message)
   if Loader.Config.Verbose then
@@ -46,6 +51,10 @@ end
 local function warnOut(message)
   warn("[x64ui-loader] " .. tostring(message))
 end
+
+--==============================================================
+-- FILESYSTEM
+--==============================================================
 
 local FS = {
   CanRead = type(readfile) == "function" and type(isfile) == "function",
@@ -58,90 +67,123 @@ local function readFile(path)
   if not FS.CanRead then return nil end
   local ok, exists = pcall(isfile, path)
   if not ok or not exists then return nil end
-  local ok2, data = pcall(readfile, path)
-  if ok2 and type(data) == "string" then return data end
+  local okRead, data = pcall(readfile, path)
+  if okRead and type(data) == "string" then return data end
   return nil
 end
 
+-- FIX: verify the DESTINATION after writing, not only a temp file.
 local function writeFile(path, contents)
   if not FS.CanWrite then return false end
   local temp = path .. ".tmp"
   if not pcall(writefile, temp, contents) then return false end
-  if FS.CanRead then
-    local back = readFile(temp)
-    if back ~= contents then
-      if FS.CanDelete then pcall(delfile, temp) end
-      return false
-    end
+  if FS.CanRead and readFile(temp) ~= contents then
+    if FS.CanDelete then pcall(delfile, temp) end
+    return false
   end
-  local ok = pcall(writefile, path, contents)
+  if not pcall(writefile, path, contents) then
+    if FS.CanDelete then pcall(delfile, temp) end
+    return false
+  end
   if FS.CanDelete then pcall(delfile, temp) end
-  return ok == true
+  if FS.CanRead and readFile(path) ~= contents then
+    if FS.CanDelete then pcall(delfile, path) end
+    return false
+  end
+  return true
 end
 
 local function ensureFolder(path)
   if not FS.CanFolder then return end
   local ok, exists = pcall(isfolder, path)
-  if ok and not exists then
-    pcall(makefolder, path)
+  if ok and not exists then pcall(makefolder, path) end
+end
+
+--==============================================================
+-- HTTP
+--==============================================================
+
+local bustCounter = 0
+
+-- FIX: unconditional cache-busting that survives an existing query string,
+-- seeded from wall-clock time plus a per-call counter rather than os.clock().
+local function bust(url)
+  bustCounter += 1
+  local sep = url:find("?", 1, true) and "&" or "?"
+  return ("%s%scb=%d_%d_%d"):format(url, sep, os.time(), bustCounter, math.random(1, 1e6))
+end
+
+local function requestTransports()
+  local transports = {}
+  if type(syn) == "table" and type(syn.request) == "function" then
+    transports[#transports + 1] = { name = "syn.request", fn = syn.request }
   end
+  if type(http) == "table" and type(http.request) == "function" then
+    transports[#transports + 1] = { name = "http.request", fn = http.request }
+  end
+  if type(http_request) == "function" then
+    transports[#transports + 1] = { name = "http_request", fn = http_request }
+  end
+  if type(request) == "function" then
+    transports[#transports + 1] = { name = "request", fn = request }
+  end
+  return transports
 end
 
-local function resolveRequestFunction()
-  if type(syn) == "table" and type(syn.request) == "function" then return syn.request end
-  if type(http) == "table" and type(http.request) == "function" then return http.request end
-  if type(http_request) == "function" then return http_request end
-  if type(request) == "function" then return request end
-  return nil
-end
-
+-- FIX: try every request transport, then game:HttpGet. A single non-2xx
+-- from one implementation must not mask a working transport.
 local function httpGet(url)
-  local requestFn = resolveRequestFunction()
-  local busted = url
-  if not tostring(url):find("%?", 1) then
-    busted = url .. "?t=" .. tostring(os.clock())
-  end
-  if requestFn then
-    local ok, response = pcall(requestFn, {
-      Url = busted,
+  local target = bust(url)
+  local failures = {}
+
+  for _, transport in ipairs(requestTransports()) do
+    local ok, response = pcall(transport.fn, {
+      Url = target,
       Method = "GET",
-      Headers = { ["Cache-Control"] = "no-cache" },
+      Headers = { ["Cache-Control"] = "no-cache", ["Pragma"] = "no-cache" },
     })
     if ok and type(response) == "table" then
       local status = tonumber(response.StatusCode or response.Status) or 0
       local body = response.Body or response.body
       if status >= 200 and status < 300 and type(body) == "string" and #body > 0 then
-        return body
+        return body, nil, transport.name
       end
-      return nil, ("HTTP %s for %s"):format(tostring(status), url)
+      failures[#failures + 1] = ("%s -> HTTP %s"):format(transport.name, tostring(status))
+    else
+      failures[#failures + 1] = ("%s -> %s"):format(transport.name, tostring(response))
     end
   end
-  if type(game) == "userdata" or type(game) == "table" then
-    local ok, body = pcall(function()
-      return game:HttpGet(busted, true)
-    end)
-    if ok and type(body) == "string" and #body > 0 then
-      return body
-    end
-    return nil, ("HttpGet failed for %s (%s)"):format(url, tostring(body))
+
+  local ok, body = pcall(function()
+    return game:HttpGet(target, true)
+  end)
+  if ok and type(body) == "string" and #body > 0 then
+    return body, nil, "game:HttpGet"
   end
-  return nil, "no HTTP client available"
+  failures[#failures + 1] = "game:HttpGet -> " .. tostring(body)
+  return nil, table.concat(failures, "; ")
 end
+
+--==============================================================
+-- PATHS
+--==============================================================
 
 local function sanitize(value)
   return (tostring(value):gsub("[^%w%.%-_]", ""))
 end
 
-local function baseUrl()
+local function repoRoot()
   local config = Loader.Config
-  local root = config.BaseUrl
-  if root:sub(-1) ~= "/" then
-    root = root .. "/"
+  return ("https://raw.githubusercontent.com/%s/%s/%s/"):format(
+    config.Owner, config.Repo, config.Branch
+  )
+end
+
+local function resolveUrl(entry)
+  if entry:find("^https?://", 1) then
+    return entry
   end
-  if config.Branch and config.Branch ~= "" then
-    root = root .. config.Branch .. "/"
-  end
-  return root
+  return repoRoot() .. entry
 end
 
 local function cachePath(version)
@@ -152,6 +194,26 @@ local function stampPath()
   return ("%s/version.txt"):format(Loader.Config.Folder)
 end
 
+--==============================================================
+-- VALIDATION
+--==============================================================
+
+local function classify(source)
+  if source:find("^404") or source:find("Not Found", 1, true) then
+    return "404 from the raw host — wrong repo, branch or path"
+  end
+  if source:find("<!DOCTYPE", 1, true) or source:find("<html", 1, true) then
+    return "HTML page — use raw.githubusercontent.com, not github.com"
+  end
+  if source:find("^version https://git%-lfs") then
+    return "Git LFS pointer — re-commit the file without LFS"
+  end
+  if source:find("^%-%-%[%[") then
+    return "starts like the library but ends early — TRUNCATED UPLOAD, re-push the file"
+  end
+  return "unrecognised content"
+end
+
 local function validate(source)
   local config = Loader.Config
   if type(source) ~= "string" then
@@ -159,46 +221,34 @@ local function validate(source)
   end
 
   if #source < config.MinBytes then
-    local head = source:sub(1, 120):gsub("[\r\n]", " ")
-    local hint = "unknown"
-    if source:find("^404") or source:find("Not Found", 1, true) then
-      hint = "not found — check Branch / path"
-    elseif source:find("<!DOCTYPE", 1, true) or source:find("<html", 1, true) then
-      hint = "HTML page — use raw.githubusercontent.com, not github.com"
-    elseif source:find("git%-lfs", 1, true) or source:find("git-lfs", 1, true) then
-      hint = "Git LFS pointer — commit the file without LFS"
-    elseif source:find("bootstrap", 1, true) or source:find("^%-%-%[%[", 1) then
-      hint = "truncated upload or bootstrap stub — trying next Entry"
+    return false, ("%d bytes, need >= %d — %s | head: %q")
+      :format(#source, config.MinBytes, classify(source), source:sub(1, 80):gsub("[\r\n]", " "))
+  end
+
+  for _, marker in ipairs(config.Markers) do
+    if not source:find(marker, 1, true) then
+      return false, ("missing marker %q — upload incomplete (%d bytes)"):format(marker, #source)
     end
-    return false, ("source is only %d bytes (expected >= %d)\n  hint: %s\n  head: %s")
-      :format(#source, config.MinBytes, hint, head)
-  end
-
-  if not source:find(config.Sentinel, 1, true) then
-    return false, "source does not contain the expected sentinel (X64UI)"
-  end
-
-  if not source:find("CreateWindow", 1, true) then
-    return false, "source is missing CreateWindow — incomplete library"
-  end
-
-  if not source:find("return X64UI", 1, true) then
-    return false, "source is missing 'return X64UI' — the upload is incomplete"
   end
 
   if type(loadstring) ~= "function" then
-    return false, "loadstring is unavailable in this environment"
+    return false, "loadstring is unavailable"
   end
 
   local chunk, compileError = loadstring(source)
   if not chunk then
-    return false, "source failed to compile: " .. tostring(compileError)
+    return false, "failed to compile: " .. tostring(compileError)
   end
   return true, chunk
 end
 
+--==============================================================
+-- RESOLUTION
+--==============================================================
+
 local function resolveSource()
   local config = Loader.Config
+
   local cachedVersion = readFile(stampPath())
   if cachedVersion then
     cachedVersion = cachedVersion:gsub("%s+", "")
@@ -206,25 +256,28 @@ local function resolveSource()
 
   local remoteVersion
   if not config.Offline then
-    local body, err = httpGet(baseUrl() .. config.VersionFile)
-    if body then
+    local body, err = httpGet(repoRoot() .. config.VersionFile)
+    if body and #body < 64 then
       remoteVersion = body:gsub("%s+", "")
+      info("remote version: " .. remoteVersion)
     else
-      info("version check skipped: " .. tostring(err))
+      info("version file unavailable (" .. tostring(err) .. ")")
     end
   end
 
-  local target = config.Pin or remoteVersion or cachedVersion or "latest"
+  -- FIX: never cache under a placeholder like "latest".
+  local target = config.Pin or remoteVersion or cachedVersion
+  local cacheable = target ~= nil and target ~= "" and target ~= "latest"
 
-  if not config.ForceRefresh then
+  if cacheable and not config.ForceRefresh then
     local cached = readFile(cachePath(target))
     if cached then
       local ok, chunk = validate(cached)
       if ok then
-        info("using cache " .. target)
+        info("cache hit: " .. target)
         return cached, target, "cache", chunk
       end
-      info("cached copy of " .. target .. " failed validation — refetching")
+      info("cached " .. target .. " rejected (" .. tostring(chunk) .. ") — refetching")
     end
   end
 
@@ -232,17 +285,18 @@ local function resolveSource()
     return nil, nil, nil, "offline and no valid cached copy of " .. tostring(target)
   end
 
-  local lastErr
-  for _, url in ipairs(config.Entries) do
-    info("trying " .. url)
-    local source, err = httpGet(url)
+  local report = {}
+  for _, entry in ipairs(config.Entries) do
+    local url = resolveUrl(entry)
+    local source, err, transport = httpGet(url)
     if not source then
-      lastErr = tostring(err)
-      info("  fetch failed: " .. lastErr)
+      info(("%-48s fetch failed: %s"):format(entry, tostring(err)))
+      report[#report + 1] = ("%s: fetch failed (%s)"):format(entry, tostring(err))
     else
       local ok, chunkOrReason = validate(source)
       if ok then
-        if FS.CanWrite then
+        info(("%-48s OK, %d bytes via %s"):format(entry, #source, tostring(transport)))
+        if cacheable and FS.CanWrite then
           ensureFolder(config.Folder)
           if writeFile(cachePath(target), source) then
             writeFile(stampPath(), target)
@@ -250,10 +304,10 @@ local function resolveSource()
             info("cache write failed — running from memory this session")
           end
         end
-        return source, target, "network:" .. url, chunkOrReason
+        return source, target or "unversioned", "network (" .. entry .. ")", chunkOrReason
       end
-      lastErr = tostring(chunkOrReason)
-      info("  validate failed: " .. lastErr)
+      info(("%-48s rejected: %s"):format(entry, tostring(chunkOrReason)))
+      report[#report + 1] = ("%s: %s"):format(entry, tostring(chunkOrReason))
     end
   end
 
@@ -262,14 +316,18 @@ local function resolveSource()
     if fallback then
       local ok, chunk = validate(fallback)
       if ok then
-        warnOut("all downloads failed — using cached " .. cachedVersion)
-        return fallback, cachedVersion, "cache", chunk
+        warnOut("every candidate failed — falling back to cached " .. cachedVersion)
+        return fallback, cachedVersion, "cache (fallback)", chunk
       end
     end
   end
 
-  return nil, nil, nil, lastErr or "no usable source"
+  return nil, nil, nil, "no usable source.\n  " .. table.concat(report, "\n  ")
 end
+
+--==============================================================
+-- PUBLIC
+--==============================================================
 
 function Loader.Clean()
   if not FS.CanDelete then
@@ -281,7 +339,7 @@ function Loader.Clean()
     pcall(delfile, cachePath(stamp:gsub("%s+", "")))
   end
   pcall(delfile, stampPath())
-  for _, name in ipairs({ "latest", "6.0.0-desktop", "5.5.1-desktop" }) do
+  for _, name in ipairs({ "6.0.0-desktop", "5.5.1-desktop" }) do
     pcall(delfile, cachePath(name))
   end
   info("cache cleaned")
@@ -302,27 +360,26 @@ function Loader.Load(overrides)
 
   local chunk = errOrChunk
   if type(chunk) ~= "function" then
-    local ok, c = validate(source)
+    local ok, result = validate(source)
     if not ok then
-      error("[x64ui-loader] " .. tostring(c), 0)
+      error("[x64ui-loader] " .. tostring(result), 0)
     end
-    chunk = c
+    chunk = result
   end
 
   local ok, library = pcall(chunk)
   if not ok then
-    error("[x64ui-loader] runtime error: " .. tostring(library), 0)
+    error("[x64ui-loader] the library threw while loading: " .. tostring(library), 0)
   end
   if type(library) ~= "table" or type(library.CreateWindow) ~= "function" then
-    error("[x64ui-loader] x64ui " .. tostring(version) .. " did not return a usable library", 0)
+    error("[x64ui-loader] " .. tostring(version) .. " did not return a usable library", 0)
   end
-
   if library.Supported == false then
-    warnOut("this build is desktop-only and the current device is not supported")
+    warnOut("this build is desktop-only and the current device is unsupported")
     return library
   end
 
-  info(("loaded x64ui %s from %s"):format(tostring(library.Version or version), tostring(origin)))
+  info(("loaded %s from %s"):format(tostring(library.Version or version), tostring(origin)))
   return library
 end
 
