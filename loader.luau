@@ -3,7 +3,9 @@
   Fetches, caches and executes the x64ui library.
 
   Usage:
-    local X64UI = loadstring(game:HttpGet("https://raw.githubusercontent.com/territorialism/x64/main/loader.luau"))()
+    local X64UI = loadstring(game:HttpGet(
+      "https://raw.githubusercontent.com/territorialism/x64/main/loader.luau?" .. tick()
+    ))()
 
   Optional config (set BEFORE running the loader):
     getgenv().X64UILoaderConfig = {
@@ -18,8 +20,12 @@ local Loader = {
   Config = {
     BaseUrl = "https://raw.githubusercontent.com/territorialism/x64/",
     Branch = "main",
-    Entry = "main.luau",
-    Fallbacks = { "src/init.luau", "main.luau" },
+    -- Absolute URLs, tried in order until one validates.
+    Entries = {
+      "https://raw.githubusercontent.com/territorialism/x64/main/src/init.luau",
+      "https://raw.githubusercontent.com/territorialism/x64ui/main/main.luau",
+      "https://raw.githubusercontent.com/territorialism/x64/main/main.luau",
+    },
     VersionFile = "version",
     Folder = "x64ui",
     Pin = nil,
@@ -27,7 +33,7 @@ local Loader = {
     ForceRefresh = false,
     Verbose = true,
     Sentinel = "X64UI",
-    MinBytes = 1024,
+    MinBytes = 8000,
   },
 }
 
@@ -92,7 +98,7 @@ end
 local function httpGet(url)
   local requestFn = resolveRequestFunction()
   local busted = url
-  if not url:find("%?") then
+  if not tostring(url):find("%?", 1) then
     busted = url .. "?t=" .. tostring(os.clock())
   end
   if requestFn then
@@ -156,13 +162,13 @@ local function validate(source)
     local head = source:sub(1, 120):gsub("[\r\n]", " ")
     local hint = "unknown"
     if source:find("^404") or source:find("Not Found", 1, true) then
-      hint = "not found — check Branch / Entry path"
+      hint = "not found — check Branch / path"
     elseif source:find("<!DOCTYPE", 1, true) or source:find("<html", 1, true) then
-      hint = "HTML page — BaseUrl must be raw.githubusercontent.com, not github.com"
-    elseif source:find("^version https://git%-lfs") or source:find("git-lfs", 1, true) then
+      hint = "HTML page — use raw.githubusercontent.com, not github.com"
+    elseif source:find("git%-lfs", 1, true) or source:find("git-lfs", 1, true) then
       hint = "Git LFS pointer — commit the file without LFS"
-    elseif source:find("^%-%-%[%[") or source:find("x64ui", 1, true) then
-      hint = "looks like a truncated upload or bootstrap stub — re-push the full library"
+    elseif source:find("bootstrap", 1, true) or source:find("^%-%-%[%[", 1) then
+      hint = "truncated upload or bootstrap stub — trying next Entry"
     end
     return false, ("source is only %d bytes (expected >= %d)\n  hint: %s\n  head: %s")
       :format(#source, config.MinBytes, hint, head)
@@ -172,8 +178,11 @@ local function validate(source)
     return false, "source does not contain the expected sentinel (X64UI)"
   end
 
-  local isAssembler = source:find("src/chunks", 1, true) or source:find("table.concat", 1, true)
-  if not isAssembler and not source:find("return X64UI", 1, true) then
+  if not source:find("CreateWindow", 1, true) then
+    return false, "source is missing CreateWindow — incomplete library"
+  end
+
+  if not source:find("return X64UI", 1, true) then
     return false, "source is missing 'return X64UI' — the upload is incomplete"
   end
 
@@ -186,65 +195,6 @@ local function validate(source)
     return false, "source failed to compile: " .. tostring(compileError)
   end
   return true, chunk
-end
-
-local function tryAssembleFromChunks()
-  local root = baseUrl()
-  local names = {
-    "c01.luau", "c02.luau", "c03.luau", "c04.luau",
-    "c05.luau", "c06.luau", "c07.luau", "c08.luau",
-  }
-  local parts = {}
-  for _, name in ipairs(names) do
-    local body, err = httpGet(root .. "src/chunks/" .. name)
-    if not body then
-      return nil, "chunk " .. name .. " missing: " .. tostring(err)
-    end
-    parts[#parts + 1] = body
-  end
-  local source = table.concat(parts)
-  info(("assembled %d chunks → %d bytes"):format(#names, #source))
-  return source
-end
-
-local function downloadLibrary()
-  local root = baseUrl()
-  local tried = {}
-  local entries = { Loader.Config.Entry }
-  for _, fb in ipairs(Loader.Config.Fallbacks or {}) do
-    if fb ~= Loader.Config.Entry then
-      entries[#entries + 1] = fb
-    end
-  end
-
-  for _, entry in ipairs(entries) do
-    info("trying " .. entry)
-    local source, err = httpGet(root .. entry)
-    if source then
-      local ok, reason = validate(source)
-      if ok then
-        return source, entry
-      end
-      tried[#tried + 1] = entry .. ": " .. tostring(reason)
-      info(entry .. " invalid: " .. tostring(reason))
-    else
-      tried[#tried + 1] = entry .. ": " .. tostring(err)
-    end
-  end
-
-  info("trying src/chunks assembly")
-  local assembled, aerr = tryAssembleFromChunks()
-  if assembled then
-    local ok, reason = validate(assembled)
-    if ok then
-      return assembled, "src/chunks"
-    end
-    tried[#tried + 1] = "chunks: " .. tostring(reason)
-  else
-    tried[#tried + 1] = "chunks: " .. tostring(aerr)
-  end
-
-  return nil, table.concat(tried, " | ")
 end
 
 local function resolveSource()
@@ -264,17 +214,15 @@ local function resolveSource()
     end
   end
 
-  local target = config.Pin or remoteVersion or cachedVersion or "unknown"
-  if not target or target == "" then
-    return nil, nil, nil, "no version available — offline with an empty cache"
-  end
+  local target = config.Pin or remoteVersion or cachedVersion or "latest"
 
   if not config.ForceRefresh then
     local cached = readFile(cachePath(target))
     if cached then
-      local ok = validate(cached)
+      local ok, chunk = validate(cached)
       if ok then
-        return cached, target, "cache"
+        info("using cache " .. target)
+        return cached, target, "cache", chunk
       end
       info("cached copy of " .. target .. " failed validation — refetching")
     end
@@ -284,29 +232,43 @@ local function resolveSource()
     return nil, nil, nil, "offline and no valid cached copy of " .. tostring(target)
   end
 
-  info("downloading x64ui " .. target)
-  local source, err = downloadLibrary()
-  if not source then
-    if cachedVersion then
-      local fallback = readFile(cachePath(cachedVersion))
-      if fallback and select(1, validate(fallback)) then
-        warnOut("download failed (" .. tostring(err) .. ") — using cached " .. cachedVersion)
-        return fallback, cachedVersion, "cache"
+  local lastErr
+  for _, url in ipairs(config.Entries) do
+    info("trying " .. url)
+    local source, err = httpGet(url)
+    if not source then
+      lastErr = tostring(err)
+      info("  fetch failed: " .. lastErr)
+    else
+      local ok, chunkOrReason = validate(source)
+      if ok then
+        if FS.CanWrite then
+          ensureFolder(config.Folder)
+          if writeFile(cachePath(target), source) then
+            writeFile(stampPath(), target)
+          else
+            info("cache write failed — running from memory this session")
+          end
+        end
+        return source, target, "network:" .. url, chunkOrReason
+      end
+      lastErr = tostring(chunkOrReason)
+      info("  validate failed: " .. lastErr)
+    end
+  end
+
+  if cachedVersion then
+    local fallback = readFile(cachePath(cachedVersion))
+    if fallback then
+      local ok, chunk = validate(fallback)
+      if ok then
+        warnOut("all downloads failed — using cached " .. cachedVersion)
+        return fallback, cachedVersion, "cache", chunk
       end
     end
-    return nil, nil, nil, tostring(err)
   end
 
-  if FS.CanWrite then
-    ensureFolder(config.Folder)
-    if writeFile(cachePath(target), source) then
-      writeFile(stampPath(), target)
-    else
-      info("cache write failed — running from memory this session")
-    end
-  end
-
-  return source, target, "network"
+  return nil, nil, nil, lastErr or "no usable source"
 end
 
 function Loader.Clean()
@@ -319,6 +281,9 @@ function Loader.Clean()
     pcall(delfile, cachePath(stamp:gsub("%s+", "")))
   end
   pcall(delfile, stampPath())
+  for _, name in ipairs({ "latest", "6.0.0-desktop", "5.5.1-desktop" }) do
+    pcall(delfile, cachePath(name))
+  end
   info("cache cleaned")
   return true
 end
@@ -330,17 +295,18 @@ function Loader.Load(overrides)
     end
   end
 
-  local source, version, origin, err = resolveSource()
+  local source, version, origin, errOrChunk = resolveSource()
   if not source then
-    error("[x64ui-loader] " .. tostring(err), 0)
+    error("[x64ui-loader] " .. tostring(errOrChunk), 0)
   end
 
-  local chunk = loadstring(source, "@x64ui")
-  if not chunk then
-    chunk = loadstring(source)
-  end
-  if not chunk then
-    error("[x64ui-loader] failed to compile x64ui " .. tostring(version), 0)
+  local chunk = errOrChunk
+  if type(chunk) ~= "function" then
+    local ok, c = validate(source)
+    if not ok then
+      error("[x64ui-loader] " .. tostring(c), 0)
+    end
+    chunk = c
   end
 
   local ok, library = pcall(chunk)
@@ -356,7 +322,7 @@ function Loader.Load(overrides)
     return library
   end
 
-  info(("loaded x64ui %s from %s"):format(tostring(library.Version or version), origin))
+  info(("loaded x64ui %s from %s"):format(tostring(library.Version or version), tostring(origin)))
   return library
 end
 
